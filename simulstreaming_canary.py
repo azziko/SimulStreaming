@@ -41,6 +41,68 @@ class StreamingConfig:
     max_context_len: int
     xatt_layer: int = -2 # Layer to take cross attentions from
 
+
+# ---------------------------------------------------------------------------
+# Slide context manager
+# ---------------------------------------------------------------------------
+
+class SlideContextManager:
+    """
+    Loads slide transcription files from a directory.
+
+    Each file is named  <seconds>.OSt  (e.g. "132.OSt") and contains the
+    plain-text transcription of the slide that appeared at that second in the
+    audio.  Given a current playback position the manager returns the text of
+    the most-recently-visible slide.
+    """
+
+    def __init__(self, slides_dir: str):
+        self.slides: List[Tuple[float, str]] = []   # (start_sec, text)
+        self._load(slides_dir)
+
+    def _load(self, slides_dir: str):
+        pattern = os.path.join(slides_dir, "*.OSt")
+        paths = glob.glob(pattern)
+        if not paths:
+            logger.warning(f"SlideContextManager: no .OSt files found in '{slides_dir}'")
+            return
+
+        for path in paths:
+            basename = os.path.basename(path)           # e.g. "132.OSt"
+            stem     = os.path.splitext(basename)[0]    # e.g. "132"
+            try:
+                timestamp = float(stem)
+            except ValueError:
+                logger.warning(f"Skipping file with non-numeric stem: {basename}")
+                continue
+
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read().strip()
+
+            self.slides.append((timestamp, text))
+
+        # Sort chronologically so we can binary-search / iterate easily
+        self.slides.sort(key=lambda x: x[0])
+        logger.info(f"SlideContextManager: loaded {len(self.slides)} slides from '{slides_dir}'")
+
+    def get_slide_text(self, current_time: float) -> Optional[str]:
+        """
+        Return the text of the last slide whose start time <= current_time,
+        or None if no slide has appeared yet.
+        """
+        active_text = None
+        for start_sec, text in self.slides:
+            if start_sec <= current_time:
+                active_text = text
+            else:
+                break   # list is sorted; no need to continue
+        return active_text
+
+
+# ---------------------------------------------------------------------------
+# Argument helpers
+# ---------------------------------------------------------------------------
+
 def simulcanary_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group('Canary-v2 arguments')
     group.add_argument('--model_path', type=str, default=None, 
@@ -65,6 +127,16 @@ def simulcanary_args(parser: argparse.ArgumentParser):
     group.add_argument('--target_lang', type=str, default="en", help='Target language of the output.')
     group.add_argument('--task', type=str, choices=["asr", "ast", "transcribe", "translate"], default="transcribe", help='Task')
 
+    group = parser.add_argument_group('Slide context')
+    group.add_argument('--slides_dir', type=str, default=None,
+        help='Path to directory containing slide transcription files named <seconds>.OSt. '
+             'When provided, the text of the currently-visible slide is injected as decodercontext.')
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
 def simul_asr_factory(args):
     logger.setLevel(args.log_level)
     decoder = args.decoder
@@ -79,14 +151,24 @@ def simul_asr_factory(args):
             decoder = "greedy"
         elif decoder not in ("beam","greedy"):
             raise ValueError("Invalid decoder type. Use 'beam' or 'greedy'.")
-    
+
     a = { v:getattr(args, v) for v in ["model_path", "decoder", "frame_threshold", "max_context_len", "audio_max_len", "beams", "task",
                                         'source_lang', 'target_lang'
                                        ]}
-
     a["decoder"] = decoder
+
+    # Build optional slide manager
+    slide_manager = None
+    if getattr(args, 'slides_dir', None):
+        slide_manager = SlideContextManager(args.slides_dir)
+
     asr = SimulCanaryASR(**a)
-    return asr, SimulCanaryOnline(asr)
+    return asr, SimulCanaryOnline(asr, slide_manager=slide_manager)
+
+
+# ---------------------------------------------------------------------------
+# ASR model wrapper
+# ---------------------------------------------------------------------------
 
 class SimulCanaryASR:
     def __init__(self, model_path, decoder, frame_threshold, max_context_len, audio_max_len, beams, task, source_lang, target_lang):
@@ -127,14 +209,32 @@ class SimulCanaryASR:
     def warmup(self, audio):
         self.model.transcribe(audio)
 
-    def construct_prompt(self, context, prefix):
+    def construct_prompt(self, context, prefix, slide_text: Optional[str] = None):
         """
-        Build input prompt and return decoder_input_ids
+        Build input prompt and return decoder_input_ids.
+
+        Parameters
+        ----------
+        context   : token-id list – rolling context from the previous audio window
+        prefix    : token-id list – already-emitted tokens in the current window
+        slide_text: plain text of the currently-visible slide (optional).
+                    When provided it is used as the decodercontext, *prepended*
+                    to whatever context tokens we already have so the model
+                    sees both the slide and any prior transcript.
         """
 
         default_turns = self.model.prompt.get_default_dialog_slots()
         default_slots = copy.deepcopy(default_turns[0]["slots"])
-        default_slots["decodercontext"] = self.model.tokenizer.ids_to_text(context)
+
+        # --- build the decodercontext string ---
+        # Use only the current slide text; rolling token context is ignored.
+        if slide_text:
+            decoder_context = slide_text
+            logger.debug(f"Injecting slide context ({len(slide_text)} chars)")
+        else:
+            decoder_context = ""
+
+        default_slots["decodercontext"] = decoder_context
         default_slots["source_lang"] = self.default_prompt['source_lang']
         default_slots["target_lang"] = self.default_prompt['target_lang']
         default_slots["task"] = self.default_prompt['task']
@@ -165,11 +265,17 @@ class SimulCanaryASR:
 
         return cfg_copy, decoder_input_ids
 
+
+# ---------------------------------------------------------------------------
+# Online streaming processor
+# ---------------------------------------------------------------------------
+
 class SimulCanaryOnline(OnlineProcessorInterface):
-    def __init__(self, asr: SimulCanaryASR):
+    def __init__(self, asr: SimulCanaryASR, slide_manager: Optional[SlideContextManager] = None):
         self.asr = asr
         self.model = asr.model
         self.cfg = asr.cfg
+        self.slide_manager = slide_manager
         self._init_stream_state()
         self.sample_rate = asr.sample_rate
 
@@ -194,6 +300,14 @@ class SimulCanaryOnline(OnlineProcessorInterface):
             return None
         
         return np.concatenate(self.audio_chunks, axis=0)
+
+    def _current_audio_time(self) -> float:
+        """
+        Estimate the wall-clock second of the *end* of the current audio buffer.
+        This is used to pick which slide is currently visible.
+        """
+        buffered_seconds = sum(len(c) for c in self.audio_chunks) / self.sample_rate
+        return self.audio_buffer_offset + buffered_seconds
 
     def normalize_attn(self, attn: torch.Tensor):
         """
@@ -348,9 +462,18 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         flattened_history = flatten_list(self.output_history)
         flattened_context = flatten_list(self.context_buffer)
 
+        # Resolve the currently-visible slide (if a slide manager was provided)
+        slide_text: Optional[str] = None
+        if self.slide_manager is not None:
+            current_time = self._current_audio_time()
+            slide_text = self.slide_manager.get_slide_text(current_time)
+            if slide_text:
+                logger.info(f"Slide context active at t={current_time:.1f}s: '{slide_text[:60]}...'")
+
         override_config, decoder_input_ids = self.asr.construct_prompt(
             context=flattened_context,
-            prefix=flattened_history
+            prefix=flattened_history,
+            slide_text=slide_text,
         )
 
         output = self.model.transcribe(
