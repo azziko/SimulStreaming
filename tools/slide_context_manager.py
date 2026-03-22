@@ -30,7 +30,7 @@ def _load_slides(slides_dir: str) -> List[Tuple[float, str]]:
             continue
 
         with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read().strip()
+            text = " ".join(fh.read().split())
 
         slides.append((timestamp, text))
 
