@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import argparse
+import csv
 from dataclasses import dataclass, field, is_dataclass, fields
 from typing import Optional, List, Tuple
 
@@ -38,16 +39,31 @@ def flatten_list(list):
 
     return flattened
 
+def load_unboost_words(tsv_path: str, min_percent: float = 0.0) -> List[str]:
+    words: List[str] = []
+    with open(tsv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            word = row["word"]
+            try:
+                pct = float(row["percent"])
+            except (KeyError, ValueError):
+                logger.warning("Skipping malformed TSV row: %s", row)
+                continue
+            if pct >= min_percent:
+                words.append(word)
+    logger.info(
+        "Loaded %d unboost word(s) from %s (min_percent=%.4f)",
+        len(words), tsv_path, min_percent,
+    )
+    return words
+
 @dataclass
 class StreamingConfig:
     audio_max_len: int
     frame_threshold: int
     max_context_len: int
     xatt_layer: int = -2 # Layer to take cross attentions from
-
-# ---------------------------------------------------------------------------
-# Argument helpers
-# ---------------------------------------------------------------------------
 
 def simulcanary_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group('Canary-v2 arguments')
@@ -67,11 +83,47 @@ def simulcanary_args(parser: argparse.ArgumentParser):
     group.add_argument('--frame_threshold', type=int, default=4, 
         help='Threshold for the attention-guided decoding. The AlignAtt policy will decode only ' \
             'until this number of encoder frames from the end of audio. In frames: in one second of 16kHz input there is ceil(16000 / 16000*0.01 / 8) = 13 frames.')
+    group.add_argument('--strip_incomplete_words', action='store_true', default=False,
+        help='If set, trailing incomplete words are stripped '
+             'from the AlignAtt output before emission.')
 
     group = parser.add_argument_group('Prompt and context')
     group.add_argument('--source_lang', type=str, default="en", help='Source language of the input.')
     group.add_argument('--target_lang', type=str, default="en", help='Target language of the output.')
-    group.add_argument('--task', type=str, choices=["asr", "ast", "transcribe", "translate"], default="transcribe", help='Task')
+    group.add_argument('--task', type=str, choices=["asr", "ast", "transcribe", "translate", "s2t_translation"], default="transcribe", help='Task')
+    group.add_argument('--decoder_context', action='store_true', default=False, 
+        help='If set, outputs from the previous hypothesis outside of the current '
+             'audio_history are transferred to the <decodercontext> ')
+
+    group = parser.add_argument_group('Word unboosting (GPU-PB)')
+    group.add_argument(
+        '--unboost_words_file',
+        type=str,
+        default=None,
+        help=(
+            'Path to a TSV file (word<TAB>percent header required)'
+        ),
+    )
+    group.add_argument(
+        '--unboost_alpha',
+        type=float,
+        default=-1.0,
+    )
+    group.add_argument(
+        '--unboost_min_percent',
+        type=float,
+        default=0.0,
+        help=(
+            'Only unboost words that appear at least this percentage of the time '
+            'in the source transcription TSV. (default: 0.0 = all words in the file)'
+        ),
+    )
+    group.add_argument(
+        '--unboost_context_score',
+        type=float,
+        default=1.0,
+        help='GPU-PB context_score for the unboosting tree (default: 1.0).',
+    )
 
     group = parser.add_argument_group('Slide context')
     group.add_argument('--slides_dir', type=str, default=None,
@@ -83,10 +135,6 @@ def simulcanary_args(parser: argparse.ArgumentParser):
         help=(
             'Slide context injection strategy'
         ))
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 def simul_asr_factory(args):
     logger.setLevel(args.log_level)
@@ -103,12 +151,24 @@ def simul_asr_factory(args):
         elif decoder not in ("beam","greedy"):
             raise ValueError("Invalid decoder type. Use 'beam' or 'greedy'.")
 
+    if getattr(args, 'unboost_words_file', None) is not None and decoder == "greedy":
+        logger.info(
+            "Word unboosting requires beam strategy — switching decoder from 'greedy' to 'beam'. "
+            "beam_size will remain 1"
+        )
+        decoder = "beam"
+    
     a = { v:getattr(args, v) for v in ["model_path", "decoder", "frame_threshold", "max_context_len", "audio_max_len", "beams", "task",
                                         'source_lang', 'target_lang'
                                        ]}
-    a["decoder"] = decoder
 
-    # Build optional slide manager
+    a["decoder"] = decoder
+    for key in ("unboost_words_file", "unboost_alpha", "unboost_min_percent", "unboost_context_score"):
+        a[key] = getattr(args, key, None)
+
+    a["strip_incomplete_words"] = getattr(args, "strip_incomplete_words", False)
+    a["decoder_context"] = getattr(args, "decoder_context", False)
+    
     slide_manager = None
     if getattr(args, 'slides_dir', None):
         slide_manager = SlideContextManagerFactory.create(
@@ -119,13 +179,25 @@ def simul_asr_factory(args):
     asr = SimulCanaryASR(**a)
     return asr, SimulCanaryOnline(asr, slide_manager=slide_manager)
 
-
-# ---------------------------------------------------------------------------
-# ASR model wrapper
-# ---------------------------------------------------------------------------
-
 class SimulCanaryASR:
-    def __init__(self, model_path, decoder, frame_threshold, max_context_len, audio_max_len, beams, task, source_lang, target_lang):
+    def __init__(
+        self, 
+        model_path, 
+        decoder, 
+        frame_threshold, 
+        max_context_len, 
+        audio_max_len, 
+        beams, 
+        task, 
+        source_lang, 
+        target_lang,
+        unboost_words_file: Optional[str] = None,
+        unboost_alpha: float = -1.0,
+        unboost_min_percent: float = 0.0,
+        unboost_context_score: float = 1.0,
+        strip_incomplete_words: bool = False,
+        decoder_context: bool = False,
+    ):
         if model_path is not None:
             self.model = ASRModel.restore_from(restore_path=model_path)
         else:
@@ -134,6 +206,13 @@ class SimulCanaryASR:
         self.device = next(self.model.parameters()).device
         self.sample_rate = self.model.cfg.preprocessor.sample_rate
 
+        self.strip_incomplete_words = strip_incomplete_words
+        self.decoder_context = decoder_context
+
+        self._unboost_words: List[str] = []
+        if unboost_words_file is not None:
+            self._unboost_words = load_unboost_words(unboost_words_file, min_percent=unboost_min_percent)
+
         # Setup decoding strategy
         if hasattr(self.model, 'change_decoding_strategy'):
             multitask_decoding = MultiTaskDecodingConfig()
@@ -141,6 +220,13 @@ class SimulCanaryASR:
             multitask_decoding.compute_hypothesis_token_set = True
             multitask_decoding.return_xattn_scores = True
             multitask_decoding.beam.beam_size = beams
+
+            if self._unboost_words:
+                multitask_decoding.beam.boosting_tree.key_phrases_list = self._unboost_words
+                multitask_decoding.beam.boosting_tree.context_score = unboost_context_score
+                multitask_decoding.beam.boosting_tree.depth_scaling = 1.0
+                multitask_decoding.beam.boosting_tree_alpha = unboost_alpha
+
             self.model.change_decoding_strategy(multitask_decoding)
 
         #override default transcribe values with this
@@ -148,6 +234,7 @@ class SimulCanaryASR:
             batch_size=1, # Batch size is one, one input stream per connection
             return_hypotheses=True, # return Hypothesis class
             enable_chunking=False, # Disable chunking because we need cross-attention scores
+            timestamps=True,
             verbose=False,
         )
 
@@ -163,22 +250,18 @@ class SimulCanaryASR:
     def warmup(self, audio):
         self.model.transcribe(audio)
 
-    def construct_prompt(self, context, prefix, slide_text: Optional[str] = None):
+    def construct_prompt(self, context, prefix, slide_text):
         """
-        Build input prompt and return decoder_input_ids.
+        Build input prompt and return decoder_input_ids
         """
 
         default_turns = self.model.prompt.get_default_dialog_slots()
         default_slots = copy.deepcopy(default_turns[0]["slots"])
-
-        # --- build the decodercontext string ---
-        if slide_text:
-            decoder_context = slide_text
-            logger.debug(f"Injecting slide context ({len(slide_text)} chars)")
+        if slide_text is not None:
+            default_slots["decodercontext"] = slide_text
         else:
-            decoder_context = ""
+            default_slots["decodercontext"] = self.model.tokenizer.ids_to_text(context)
 
-        default_slots["decodercontext"] = decoder_context
         default_slots["source_lang"] = self.default_prompt['source_lang']
         default_slots["target_lang"] = self.default_prompt['target_lang']
         default_slots["task"] = self.default_prompt['task']
@@ -209,19 +292,17 @@ class SimulCanaryASR:
 
         return cfg_copy, decoder_input_ids
 
-
-# ---------------------------------------------------------------------------
-# Online streaming processor
-# ---------------------------------------------------------------------------
-
 class SimulCanaryOnline(OnlineProcessorInterface):
     def __init__(self, asr: SimulCanaryASR, slide_manager: Optional[BaseSlideContextManager] = None):
         self.asr = asr
         self.model = asr.model
         self.cfg = asr.cfg
-        self.slide_manager = slide_manager
         self._init_stream_state()
         self.sample_rate = asr.sample_rate
+        self.strip_incomplete_words = asr.strip_incomplete_words
+        self.decoder_context = asr.decoder_context
+        self.slide_manager = slide_manager
+        self.init()
 
     def init(self, offset=None):
         self.is_last = False
@@ -231,6 +312,7 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         self.context_buffer = []
         self.output_history = []
         self.audio_chunks = []
+        self.audio_history = []
         self.audio_buffer_offset = offset
 
     def insert_audio_chunk(self, audio):
@@ -245,12 +327,15 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         
         return np.concatenate(self.audio_chunks, axis=0)
 
+    def _preprocess(self, audio):
+        if audio is not None:
+            self.audio_history.append(audio)
+
+        return np.concatenate(self.audio_history, axis=0)
+
     def _current_audio_time(self) -> float:
-        """
-        Estimate the wall-clock second of the *end* of the current audio buffer.
-        This is used to pick which slide is currently visible.
-        """
-        buffered_seconds = sum(len(c) for c in self.audio_chunks) / self.sample_rate
+        buffered_seconds = sum(len(audio_chunk) for audio_chunk in self.audio_history) / self.sample_rate
+
         return self.audio_buffer_offset + buffered_seconds
 
     def normalize_attn(self, attn: torch.Tensor):
@@ -267,20 +352,24 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         Update audio history based on the audio_max_len. Push previous output to the output history.
         """
 
-        if output is not None and len(output) > 0:
+        if output is not None:
             self.output_history.append(output)
+        else:
+            self.output_history.append([])
 
-        total_audio_len = sum(len(audio_chunk) for audio_chunk in self.audio_chunks)
+        total_audio_len = sum(len(audio_chunk) for audio_chunk in self.audio_history)
         while (total_audio_len / self.sample_rate > self.cfg.audio_max_len and
-            self.audio_chunks and
+            self.audio_history and
             self.output_history):
 
-            removed_chunk = self.audio_chunks.pop(0)
+            removed_chunk = self.audio_history.pop(0)
 
             self.audio_buffer_offset += len(removed_chunk) / self.sample_rate
             
             total_audio_len -= len(removed_chunk)
-            self.context_buffer.append(self.output_history.pop(0))
+            removed_out_prefix = self.output_history.pop(0)
+            if self.decoder_context:
+                self.context_buffer.append(removed_out_prefix)
 
         total_context_len = sum(len(chunk) for chunk in self.context_buffer)
         while total_context_len > self.cfg.max_context_len:
@@ -291,6 +380,7 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         """
         Remove last incomplete word(s) from the new hypothesis.
         """
+
         tokens_to_write = []
         # iterate from the end and count how many trailing tokens to drop
         num_tokens_incomplete = 0
@@ -300,6 +390,7 @@ class SimulCanaryOnline(OnlineProcessorInterface):
                 # slice off the trailing incomplete tokens
                 tokens_to_write = tokens[:-num_tokens_incomplete]
                 break
+
         return tokens_to_write
 
     def alignatt_policy(self, generated_tokens, cross_attn) -> List[str]:
@@ -326,7 +417,9 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         if len(invalid_tok_ids) > 0:
             selected_tokens = selected_tokens[:invalid_tok_ids[0]]
 
-        selected_tokens = self._strip_incomplete_words(selected_tokens)
+        # Strip incomplete words(if set as a param)
+        if self.strip_incomplete_words:
+            selected_tokens = self._strip_incomplete_words(selected_tokens)
 
         return selected_tokens
 
@@ -396,33 +489,49 @@ class SimulCanaryOnline(OnlineProcessorInterface):
                 'text':  ts['word'],
                 'tokens': word_token_groups[i],
             })
-            logger.debug(f"TS-WORD-INFO: {result[-1]}")
 
         return result
 
+    def _modify_emit_text(self, tokens: List[str]) -> str:
+        #Add space if the first emitted token is not a continuation of the previous
+        if len(tokens) > 0 and tokens[0].startswith(BOW_PREFIX):
+            return f" {self.model.tokenizer.tokens_to_text(tokens)}"
+
+        return self.model.tokenizer.tokens_to_text(tokens) 
+
+    def _remove_eos_tokens(self, tokens: List[int]) -> List[int]:
+        if len(tokens) < 1:
+            return tokens
+        
+        pos = 0
+        while tokens[pos] == self.model.tokenizer.eos_id and pos < len(tokens):
+            pos += 1
+
+        return tokens[pos:]
+
     def process_iter(self):
         speech = self._concat_audio_chunks()
+        self.audio_chunks = []
+
+        input_speech = self._preprocess(speech)
 
         flattened_history = flatten_list(self.output_history)
         flattened_context = flatten_list(self.context_buffer)
 
-        # Resolve the currently-visible slide (if a slide manager was provided)
-        slide_text: Optional[str] = None
+        # Resolve the currently-visible slide
+        slide_text = None
         if self.slide_manager is not None:
             current_time = self._current_audio_time()
             slide_text = self.slide_manager.get_slide_text(current_time)
-            if slide_text:
-                logger.info(f"Slide context active at t={current_time:.1f}s: '{slide_text[:60]}...'")
 
         override_config, decoder_input_ids = self.asr.construct_prompt(
             context=flattened_context,
             prefix=flattened_history,
-            slide_text=slide_text,
+            slide_text=slide_text
         )
 
         output = self.model.transcribe(
-            speech,
-            timestamps=True,
+            input_speech,
             override_config=override_config
         )
 
@@ -430,16 +539,22 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         if isinstance(generated_tokens, torch.Tensor):
             generated_tokens = generated_tokens.detach().cpu().tolist()
         
-        xatt_raw = output[0].xatt_scores[self.cfg.xatt_layer][:, :decoder_input_ids.shape[1] + len(generated_tokens), :]
+        # Remove possible EOS tokens because of forced prefix
+        generated_tokens = self._remove_eos_tokens(generated_tokens)
+        
+        xatt_raw = output[0].xatt_scores[self.cfg.xatt_layer]
         xatt_mean = xatt_raw.mean(dim=0)
         xatt_norm = self.normalize_attn(xatt_mean)
 
         if self.is_last:
-            selected_output = output[0].tokens
+            selected_output = output[0].tokens[-len(generated_tokens):]
         else:
-            selected_output = self.alignatt_policy(output[0].tokens, xatt_norm)
+            selected_output = self.alignatt_policy(output[0].tokens[-len(generated_tokens):], xatt_norm)
 
         selected_ids: List[int] = generated_tokens[:len(selected_output)]
+
+        #Text to emit
+        text = self._modify_emit_text(selected_output)
 
         self.update_history(selected_ids)
 
@@ -464,7 +579,7 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         return {
             "start":  seg_start,
             "end":    seg_end,
-            "text":   self.model.tokenizer.ids_to_text(selected_ids),
+            "text":   text,
             "tokens": selected_ids,
             "words":  words,
         }
@@ -473,6 +588,8 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         logger.info("Finish")
         self.is_last = True
         o = self.process_iter()
+
+        self.context_buffer = []
         self.is_last = False
 
         return o
