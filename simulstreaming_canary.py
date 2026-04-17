@@ -121,6 +121,34 @@ def simulcanary_args(parser: argparse.ArgumentParser):
         help='GPU-PB context_score for the unboosting tree (default: 1.0).',
     )
 
+    group = parser.add_argument_group('LID + LLM cascade (language correction)')
+    group.add_argument(
+        '--use_cascade',
+        action='store_true', default=False,
+        help='Enable the Lingua-py LID + LLM translation cascade. When the detected output '
+             'language does not match --target_lang, the segment is forwarded through the LLM.',
+    )
+    group.add_argument(
+        '--cascade_model',
+        type=str,
+        choices=['gemma-2b', 'qwen-0.5b', 'qwen-1.5b'],
+        default='qwen-0.5b',
+        help='LLM for translation correction. '
+             'gemma-2b = google/gemma-3-2b-it; '
+             'qwen-0.5b = Qwen/Qwen2-0.5B-Instruct; '
+             'qwen-1.5b = Qwen/Qwen2-1.5B-Instruct.',
+    )
+    group.add_argument(
+        '--cascade_min_chars',
+        type=int, default=8,
+        help='Minimum segment length in characters for language detection to be attempted.',
+    )
+    group.add_argument(
+        '--cascade_max_new_tokens',
+        type=int, default=128,
+        help='Maximum tokens the LLM may generate per translation call.',
+    )
+
 def simul_asr_factory(args):
     logger.setLevel(args.log_level)
     decoder = args.decoder
@@ -153,7 +181,22 @@ def simul_asr_factory(args):
 
     a["strip_incomplete_words"] = getattr(args, "strip_incomplete_words", False)
     a["decoder_context"] = getattr(args, "decoder_context", False)
-    
+
+    cascade_cfg = None
+    if getattr(args, "use_cascade", False):
+        lingua_langs = [args.source_lang, args.target_lang]
+
+        cascade_cfg = {
+            "model_key":      getattr(args, "cascade_model", "qwen-0.5b"),
+            "target_lang":    args.target_lang,
+            "lingua_langs":   lingua_langs,
+            "device":         getattr(args, "cascade_device", "cuda"),
+            "min_chars":      getattr(args, "cascade_min_chars", 8),
+            "max_new_tokens": getattr(args, "cascade_max_new_tokens", 128),
+        }
+ 
+    a["cascade_cfg"] = cascade_cfg    
+
     asr = SimulCanaryASR(**a)
     return asr, SimulCanaryOnline(asr)
 
@@ -175,6 +218,7 @@ class SimulCanaryASR:
         unboost_context_score: float = 1.0,
         strip_incomplete_words: bool = False,
         decoder_context: bool = False,
+        cascade_cfg: Optional[dict] = None,
     ):
         if model_path is not None:
             self.model = ASRModel.restore_from(restore_path=model_path)
@@ -224,6 +268,22 @@ class SimulCanaryASR:
             max_context_len=max_context_len,
             xatt_layer=self.model.cfg.decoding.get("xatt_scores_layer", -2),
         )
+
+        self.cascade: Optional["LLMCascadeProcessor"] = None  # noqa: F821
+        if cascade_cfg is not None:
+            self._init_cascade(cascade_cfg)
+ 
+    def _init_cascade(self, cfg: dict) -> None:
+        from tools.llm_helper import LLMCascadeProcessor
+        self.cascade = LLMCascadeProcessor(
+            model_key=cfg["model_key"],
+            target_lang=cfg["target_lang"],
+            lingua_lang_codes=cfg["lingua_langs"],
+            device=self.device,
+            min_chars=cfg["min_chars"],
+            max_new_tokens=cfg["max_new_tokens"],
+        )
+        self.cascade.preload()
 
     def warmup(self, audio):
         self.model.transcribe(audio)
@@ -517,6 +577,10 @@ class SimulCanaryOnline(OnlineProcessorInterface):
         #Text to emit
         text = self._modify_emit_text(selected_output)
 
+        if self.asr.cascade is not None and text.strip():
+            text = self.asr.cascade.process(text)
+            selected_ids = self.model.tokenizer.text_to_ids(text.strip())
+        
         self.update_history(selected_ids)
 
         # Combine timestamps
